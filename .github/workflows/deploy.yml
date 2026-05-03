@@ -1,0 +1,57 @@
+name: Build and deploy to EC2
+on:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    env:
+      ECR_REPO: my-repo
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ secrets.OIDC_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to ECR
+        run: |
+          aws ecr get-login-password --region ${{ secrets.AWS_REGION }} | docker login --username AWS --password-stdin ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
+
+      - name: Build image
+        run: |
+          IMAGE_TAG=${{ github.sha }}
+          docker build -t ${{ env.ECR_REPO }}:$IMAGE_TAG .
+          docker tag ${{ env.ECR_REPO }}:$IMAGE_TAG ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:$IMAGE_TAG
+
+      - name: Push image to ECR
+        run: |
+          IMAGE_TAG=${{ github.sha }}
+          docker push ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:$IMAGE_TAG
+
+      - name: Upload .env to EC2 (from GitHub Secret `APP_ENV`)
+        env:
+          APP_ENV: ${{ secrets.APP_ENV }}
+        run: |
+          aws ssm send-command \
+            --instance-ids "${{ secrets.INSTANCE_ID }}" \
+            --document-name "AWS-RunShellScript" \
+            --parameters commands="['mkdir -p /opt/deploy', 'bash -lc \"cat > /opt/deploy/.env <<\\'EOF\\'\\n$APP_ENV\\nEOF\"', 'chmod 600 /opt/deploy/.env']" \
+            --comment "Upload .env"
+
+      - name: Trigger deploy via SSM
+        run: |
+          IMAGE_TAG=${{ github.sha }}
+          aws ssm send-command \
+            --instance-ids "${{ secrets.INSTANCE_ID }}" \
+            --document-name "AWS-RunShellScript" \
+            --parameters commands="['/opt/deploy/run_deploy.sh ${{ secrets.AWS_ACCOUNT_ID }} ${{ secrets.AWS_REGION }} ${{ env.ECR_REPO }} ${IMAGE_TAG}']" \
+            --comment "Deploy $IMAGE_TAG"
+
